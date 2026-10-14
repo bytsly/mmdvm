@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 第三方依赖库（用 install_packages.py 或 pip install -r requirements.txt 安装）
+_lib/
+
+# PyInstaller 构建产物
+build/
+build_temp/
+dist/
+output/
+*.whl
+
+# 运行时下载的呼号数据库（登录后自动下载到 up 目录）
+up/data/
+up/*.dat
+up/*.csv
+up/*.bak
+up/.part/
+
+# 日志与临时文件
+*.log
+build_log*.txt
+_install_log.txt
+_pip_log.txt
+
+# 运行/更新时自动生成的批处理
+do_update.bat
+update_reminder.bat
+
+# 诊断用临时脚本
+diag_*.py
+diag.spec
+
+# 临时工作目录与备份
+TMP/
+brand_templates_backup.db
+
+# 联系人转换输出结果
+CSV/OUT/
+
+# macOS 元数据文件
+._*

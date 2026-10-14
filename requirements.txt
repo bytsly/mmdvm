@@ -1,0 +1,8 @@
+paramiko>=2.7.0,<5.0.0
+requests>=2.32.0,<3.0.0
+pandas>=2.0.0,<3.0.0
+# Notes:
+# - We set conservative upper bounds on major versions to avoid automatic upgrades
+#   that may introduce breaking changes. For fully reproducible installs, consider
+#   pinning exact versions (e.g. pandas==2.3.3) or using a pip constraints file
+#   with hashes (pip-compile / requirements.txt with hashes).
