@@ -29,7 +29,7 @@ from brand_database import BrandDatabase
 # （从 _lib 加载，避免启动时全部加载）
 
 class MMDVMUpdater:
-    VERSION = "2.0"
+    VERSION = "2.01"
 
     # GitHub Releases 自动更新配置
     GITHUB_OWNER = "bytsly"
@@ -225,7 +225,7 @@ class MMDVMUpdater:
                             "1、开始扫描，在发现的设备中单击填入登录信息（双击打开设备网页）\n"
                             "2、点击登录，自动识别盒子为国服或BM，并把呼号数据库下载到软件目录的 up 目录\n"
                             "3、（可选）点 编辑user.csv，按呼号查询后把数字联系人的姓名、QTH 改成中文并提交保存；勾选 BI7ANY大屏 则生成大屏中文联系人并配置显示\n"
-                            "4、点 更新盒子，把 up 目录的数据上传到盒子（同时建 stripped.csv 软链接、锁定文件并禁用每日自动更新）\n"
+                            "4、点 更新盒子，把 up 目录的数据上传到盒子\n"
                             "5、联系人工具用于生成手台联系人文件，模板放 CSV 目录，结果在 OUT 目录查找")
         instruction_label = ttk.Label(
             instruction_frame,
@@ -1140,7 +1140,9 @@ class MMDVMUpdater:
     def configure_bi7any_big_screen(self, up_dir, enable=True):
         """BI7ANY 大屏配置。
         enable=True ：从 up/user.csv 生成 nextionUsers.csv 上传，MMDVMHost.ini 的
-                      DMRidFile 指向 nextionUsers.csv，并重启 mmdvmhost 服务。
+                      DMRidFile 指向 nextionUsers.csv，并按 BI7ANY 大屏要求配置
+                      [NextionDriver] 段（GroupsFile=nextionUsers.csv、
+                      DMRidFile=user.csv 及列映射），重启 mmdvmhost/nextiondriver。
         enable=False：DMRidFile 切回原生 stripped.csv，并重启 mmdvmhost 服务。"""
         ini_path = "/etc/MMDVMHost.ini"
 
@@ -1194,13 +1196,45 @@ class MMDVMUpdater:
             self.root.after(0, lambda: self.log("↩️ 还原为原生 stripped.csv ..."))
             sed_cmd = r'sed -i "s/^DMRidFile=.*/DMRidFile=stripped.csv/" /etc/MMDVMHost.ini'
 
-        # 4. 修改配置并重启 mmdvmhost 服务使改动生效
+        # 4. 修改配置
         self.execute_ssh_command_with_sudo(f"chattr -i {ini_path}", check_output=False)
         self.execute_ssh_command_with_sudo(sed_cmd, check_output=False)
         target = "nextionUsers.csv" if enable else "stripped.csv"
         self.root.after(0, lambda t=target: self.log(f"✅ MMDVMHost.ini 的 DMRidFile 已指向 {t}"))
+
+        # 5. 勾选时按 BI7ANY 大屏要求配置 [NextionDriver] 段
+        if enable:
+            self._configure_nextion_driver_section(ini_path)
+
+        # 6. 重启服务使改动生效
         self.execute_ssh_command_with_sudo("systemctl restart mmdvmhost", check_output=False)
-        self.root.after(0, lambda: self.log("✅ mmdvmhost 服务已重启，配置生效"))
+        if enable:
+            self.execute_ssh_command_with_sudo("systemctl restart nextiondriver", check_output=False)
+            self.root.after(0, lambda: self.log("✅ mmdvmhost / nextiondriver 服务已重启，配置生效"))
+        else:
+            self.root.after(0, lambda: self.log("✅ mmdvmhost 服务已重启，配置生效"))
+
+    def _configure_nextion_driver_section(self, ini_path):
+        """把 MMDVMHost.ini 的 [NextionDriver] 段数据文件配置写成 BI7ANY 大屏
+        所需的标准值。sed 用地址范围限定只改 [NextionDriver] 到下一配置段之间的
+        内容，不影响其它配置段中的同名字段。"""
+        section_settings = [
+            ("GroupsFile", "nextionUsers.csv"),
+            ("DMRidFile", "user.csv"),
+        ]
+        self.root.after(0, lambda: self.log("🖥️ 写入 [NextionDriver] 段配置..."))
+        for key, value in section_settings:
+            sed = (f'sed -i "/^\\[NextionDriver\\]/,/^\\[/ '
+                   f's/^{key}=.*/{key}={value}/" {ini_path}')
+            self.execute_ssh_command_with_sudo(sed, check_output=False)
+
+        # 读回该段配置显示到日志，便于用户核对
+        verify = self.execute_ssh_command_with_sudo(
+            r'sed -n "/^\[NextionDriver\]/,/^\[/p" ' + ini_path +
+            r' | grep -E "^(GroupsFile|DMRidFile)="', check_output=False)
+        shown = " ".join(line.strip() for line in verify.splitlines()
+                         if "=" in line)[:200]
+        self.root.after(0, lambda s=shown: self.log(f"✅ [NextionDriver] 已配置: {s}"))
 
     def perform_bm_download(self):
         """执行合并服数据更新 - 将本地 up 目录中的数据文件通过 SFTP 上传到设备"""
