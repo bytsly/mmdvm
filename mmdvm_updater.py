@@ -24,12 +24,13 @@ import time
 import re
 import webbrowser
 from brand_database import BrandDatabase
+from p2p_sync import P2PNode
 
 # pandas、requests、json、shutil、tempfile、subprocess 将在使用时局部导入
 # （从 _lib 加载，避免启动时全部加载）
 
 class MMDVMUpdater:
-    VERSION = "2.01"
+    VERSION = "2.06"
 
     # GitHub Releases 自动更新配置
     GITHUB_OWNER = "bytsly"
@@ -75,6 +76,17 @@ class MMDVMUpdater:
         
         # 创建界面组件
         self.create_widgets()
+
+        # P2P 同步节点（后台线程运行）
+        self.p2p_node = None
+        self._p2p_merge_lock = threading.Lock()
+        self._p2p_pending = {}       # 待合并队列 radio_id -> msg（防抖批量应用）
+        self._p2p_flush_job = None
+        self._p2p_config = self._p2p_load_config()
+        self._p2p_applied_total = 0      # 本地累计应用的同步条数
+        self._p2p_last_sync_ts = 0.0     # 最近一次应用同步的时间
+        self._p2p_last_result = "尚未同步"
+        self._restart_p2p_node()
         
         # SSH客户端
         self.ssh = None
@@ -264,6 +276,27 @@ class MMDVMUpdater:
         self.bi7any_var = tk.BooleanVar(value=False)
         self.bi7any_check = ttk.Checkbutton(buttons_frame, text="BI7ANY大屏", variable=self.bi7any_var)
         self.bi7any_check.pack(side="left", padx=5)
+
+        # 呼号数据库下载状态提示（下载中/下载完成/下载失败）
+        self.download_status = ttk.Label(buttons_frame, text="", foreground="#666666")
+        self.download_status.pack(side="left", padx=(15, 5))
+
+        # P2P 同步：状态灯 + 状态显示 + 设置入口
+        self.p2p_button = ttk.Button(buttons_frame, text="同步设置", command=self.open_p2p_settings, width=10)
+        self.p2p_button.pack(side="right", padx=5)
+        self.p2p_status_label = ttk.Label(buttons_frame, text="P2P: 未启动", foreground="gray")
+        self.p2p_status_label.pack(side="right", padx=(2, 5))
+        self.p2p_light = tk.Canvas(buttons_frame, width=14, height=14,
+                                   highlightthickness=0, bg="SystemButtonFace")
+        self._p2p_light_oval = self.p2p_light.create_oval(
+            2, 2, 12, 12, fill="#9e9e9e", outline="")
+        self.p2p_light.pack(side="right")
+
+        # 点击状态灯/状态文字打开“P2P 同步状态”窗口（参考点名软件）
+        self.p2p_status_label.configure(cursor="hand2")
+        self.p2p_light.configure(cursor="hand2")
+        self.p2p_status_label.bind("<Button-1>", lambda e: self.open_p2p_status())
+        self.p2p_light.bind("<Button-1>", lambda e: self.open_p2p_status())
         
         # 进度条框架
         progress_frame = ttk.Frame(update_frame)
@@ -315,6 +348,41 @@ class MMDVMUpdater:
         except Exception:
             # 忽略任何检查时的错误，避免影响主流程
             pass
+
+    def _set_download_state(self, downloading):
+        """下载中把"更新盒子""编辑user.csv"置灰，下载结束再恢复"""
+        try:
+            if hasattr(self, 'update_button'):
+                self.update_button.config(state="disabled" if downloading else "normal")
+            if downloading:
+                if hasattr(self, 'edit_user_button'):
+                    self.edit_user_button.config(state="disabled")
+            else:
+                # 结束时按 up/user.csv 是否重新决定编辑按钮状态
+                self.update_up_dependent_buttons()
+        except Exception:
+            pass
+
+    def _set_download_status(self, text, color="#666666"):
+        """更新下载状态提示文本"""
+        try:
+            if hasattr(self, 'download_status'):
+                self.download_status.config(text=text, foreground=color)
+        except Exception:
+            pass
+
+    def _download_ui_begin(self):
+        """下载开始：提示"下载中"并锁定相关按钮"""
+        self._set_download_state(True)
+        self._set_download_status("呼号数据库下载中...", "#d46b08")
+
+    def _download_ui_end(self, failed):
+        """下载结束：显示结果并恢复按钮"""
+        self._set_download_state(False)
+        if failed:
+            self._set_download_status("下载失败，请重试", "#cf1322")
+        else:
+            self._set_download_status("呼号数据库下载完成", "#0b7a28")
         
     def start_scan(self):
         """开始扫描局域网设备"""
@@ -531,6 +599,8 @@ class MMDVMUpdater:
                      for name in ("DMRIds.dat", "user.csv", "NXDN.csv")]
 
         up_dir = self._get_up_dir()
+        failed = 0
+        self.root.after(0, self._download_ui_begin)
         try:
             os.makedirs(up_dir, exist_ok=True)
             self.root.after(0, lambda: self.log(f"开始自动下载{server_type}呼号数据库到 up 目录..."))
@@ -572,15 +642,17 @@ class MMDVMUpdater:
                                 self.log(f"⚠️ {fn} 下载失败({err})，第 {r} 次重试..."))
                             time.sleep(2)
                 else:
+                    failed += 1
                     self.root.after(0, lambda fn=name, err=last_err:
                         self.log(f"❌ {fn} 自动下载失败: {err}（可点击更新盒子重试）"))
 
             self.root.after(0, lambda: self.log("呼号数据库下载结束，可在联系人工具中查看/编辑"))
-            self.root.after(0, self.update_up_dependent_buttons)
         except Exception as e:
+            failed += 1
             self.root.after(0, lambda err=str(e): self.log(f"⚠️ 自动下载呼号数据库出错: {err}"))
         finally:
             self.root.after(0, lambda: setattr(self, 'current_file', ""))
+            self.root.after(0, lambda f=failed: self._download_ui_end(f))
 
     def update_box(self):
         """统一更新盒子入口：根据登录时检测的服务器类型调用对应的数据下载"""
@@ -1939,6 +2011,465 @@ class MMDVMUpdater:
         """获取 up/user.csv 的绝对路径（兼容脚本运行和打包 exe 运行）"""
         return os.path.join(self._get_up_dir(), "user.csv")
 
+    # ------------------------------------------------------------ P2P 同步
+    def _get_script_dir(self):
+        """软件所在目录（兼容脚本运行和打包 exe 运行）"""
+        if getattr(sys, 'frozen', False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def _p2p_config_path(self):
+        return os.path.join(self._get_script_dir(), "p2p_config.json")
+
+    def _p2p_row_ts_path(self):
+        """每行联系人最近一次 P2P 修改时间戳（后到覆盖判定依据）"""
+        return os.path.join(self._get_script_dir(), "p2p_row_ts.json")
+
+    def _p2p_load_config(self):
+        """加载 P2P 配置，不存在则用默认值"""
+        default = {
+            "enabled": True,
+            "callsign": "",
+            "listen_enabled": False,
+            "listen_port": 46001,
+            "bootstrap": [],
+        }
+        try:
+            import json
+            with open(self._p2p_config_path(), "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            default.update({k: cfg[k] for k in default if k in cfg})
+        except Exception:
+            pass
+        return default
+
+    def _p2p_save_config(self):
+        try:
+            import json
+            with open(self._p2p_config_path(), "w", encoding="utf-8") as f:
+                json.dump(self._p2p_config, f, ensure_ascii=False, indent=2)
+        except Exception as ex:
+            self._p2p_log(f"P2P 配置保存失败: {ex}")
+
+    def _p2p_log(self, text):
+        """P2P 日志写入软件目录 p2p.log（GUI 不显示）"""
+        try:
+            with open(os.path.join(self._get_script_dir(), "p2p.log"),
+                      "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
+        except Exception:
+            pass
+
+    def _restart_p2p_node(self):
+        """按当前配置（重）启动 P2P 节点"""
+        if self.p2p_node:
+            try:
+                self.p2p_node.stop()
+            except Exception:
+                pass
+            self.p2p_node = None
+        cfg = self._p2p_config
+        if not cfg.get("enabled"):
+            self._update_p2p_status("P2P: 已禁用", "gray")
+            return
+        try:
+            self.p2p_node = P2PNode(
+                callsign=cfg.get("callsign") or "anonymous",
+                listen_enabled=bool(cfg.get("listen_enabled")),
+                listen_port=int(cfg.get("listen_port", 46001)),
+                bootstrap=cfg.get("bootstrap") or [],
+                data_dir=self._get_script_dir(),
+                on_user_update=self._apply_p2p_update,
+                on_status=self._on_p2p_peer_count,
+                on_log=self._p2p_log,
+            )
+            self.p2p_node.start()
+            self._update_p2p_status("P2P: 连接中...", "orange")
+        except Exception as ex:
+            self.p2p_node = None
+            self._p2p_log(f"P2P 节点启动失败: {ex}")
+            self._update_p2p_status("P2P: 启动失败", "red")
+
+    def _on_p2p_peer_count(self, count):
+        """节点数变化回调（P2P 线程）→ 切到 GUI 线程刷新"""
+        self.root.after(0, lambda c=count: self._update_p2p_status(
+            f"P2P: {c} 个节点", "green" if c > 0 else "orange"))
+
+    def _update_p2p_status(self, text, color="gray"):
+        """刷新 P2P 状态标签和状态灯（绿=已连网 黄=连接中 红=失败 灰=禁用）"""
+        light_colors = {"green": "#2ecc40", "orange": "#ffab00",
+                        "red": "#e53935", "gray": "#9e9e9e"}
+        try:
+            self.p2p_status_label.config(text=text, foreground=color)
+            self.p2p_light.itemconfig(
+                self._p2p_light_oval,
+                fill=light_colors.get(color, "#9e9e9e"))
+        except Exception:
+            pass
+
+    def open_p2p_status(self):
+        """P2P 同步状态窗口（参考点名软件：状态文字 + 自动刷新 + 手动刷新）"""
+        win = tk.Toplevel(self.root)
+        win.title("P2P 同步状态")
+        win.geometry("620x420")
+        win.transient(self.root)
+        self.center_window(win)
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        text = tk.Text(frm, font=("Consolas", 10), wrap=tk.WORD,
+                       relief="groove", borderwidth=1)
+        text.pack(fill=tk.BOTH, expand=True)
+        text.configure(state="disabled")
+
+        def render():
+            try:
+                content = self._format_p2p_status()
+            except Exception as ex:
+                content = f"读取同步状态失败: {ex}"
+            text.configure(state="normal")
+            text.delete("1.0", tk.END)
+            text.insert(tk.END, content)
+            text.configure(state="disabled")
+
+        job = {"id": None}
+
+        def tick():
+            render()
+            job["id"] = win.after(2000, tick)
+
+        def close():
+            if job["id"]:
+                try:
+                    win.after_cancel(job["id"])
+                except Exception:
+                    pass
+            win.destroy()
+
+        btn_row = ttk.Frame(frm)
+        btn_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btn_row, text="关闭", command=close).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="刷新", command=render).pack(side=tk.RIGHT, padx=6)
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        render()
+        job["id"] = win.after(2000, tick)
+
+    def _format_p2p_status(self):
+        """把节点状态与本地同步统计格式化成可读文本"""
+        cfg = self._p2p_config or {}
+        node = self.p2p_node
+        st = node.status() if node else {}
+
+        def when(ts):
+            try:
+                if not ts:
+                    return "无"
+                return time.strftime("%Y-%m-%d %H:%M:%S",
+                                     time.localtime(float(ts)))
+            except (ValueError, OSError):
+                return "无"
+
+        if not cfg.get("enabled"):
+            running = "已禁用"
+        elif node:
+            running = "运行中" if st.get("running") else "已停止"
+        else:
+            running = "未启动"
+
+        bootstrap = "、".join(cfg.get("bootstrap") or []) \
+            or "未配置（可在“同步设置”里填写 host:端口）"
+        lines = [
+            f"运行状态: {running}",
+            f"本机呼号: {cfg.get('callsign') or '未设置'}",
+            "监听入站: " + (
+                f"已开启，端口 {cfg.get('listen_port', 46001)}"
+                if cfg.get("listen_enabled") else "未开启"),
+            f"引导节点: {bootstrap}",
+            f"已连接节点: {st.get('peer_count', 0)}    已知节点: {len(st.get('known_peers') or [])}",
+            f"本地历史消息: {st.get('history_count', 0)} 条，最近一条: {when(st.get('last_ts'))}",
+            f"本地累计应用: {self._p2p_applied_total} 条，最近同步: {when(self._p2p_last_sync_ts)}",
+            f"最近结果: {self._p2p_last_result}",
+            "",
+            "连接明细:",
+        ]
+
+        peers = st.get("peers") or []
+        if not peers:
+            lines.append("  （暂无已连接节点）")
+        for p in peers:
+            direction = "入站" if p.get("inbound") else "出站"
+            lines.append(
+                f"  [{direction}] {p.get('address', '-')}  "
+                f"呼号: {p.get('callsign') or '-'}  "
+                f"对方监听端口: {p.get('listen_port') or '-'}")
+
+        known = st.get("known_peers") or []
+        if known:
+            lines.append("")
+            lines.append("已知节点: " + "、".join(known))
+
+        if not (cfg.get("bootstrap") or []):
+            lines.append("")
+            lines.append("提示: 引导节点为空，客户端不会主动连接中继；"
+                         "可在“同步设置”中填写中继地址（如 127.0.0.1:46001）。")
+        elif not peers:
+            lines.append("")
+            lines.append("提示: 已配置引导节点但当前未连上，"
+                         "请检查中继服务端口是否开放、网络是否可达。")
+        return "\n".join(lines)
+
+    def _p2p_load_row_ts(self):
+        try:
+            import json
+            with open(self._p2p_row_ts_path(), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _p2p_save_row_ts(self, row_ts):
+        try:
+            import json
+            with open(self._p2p_row_ts_path(), "w", encoding="utf-8") as f:
+                json.dump(row_ts, f, ensure_ascii=False)
+        except Exception as ex:
+            self._p2p_log(f"P2P 行时间戳保存失败: {ex}")
+
+    @staticmethod
+    def _atomic_write_csv(df, csv_path):
+        """原子写入 CSV：先写临时文件再替换，避免并发读到写一半的文件"""
+        tmp_path = csv_path + ".tmp"
+        df.to_csv(tmp_path, index=False, encoding="utf-8")
+        os.replace(tmp_path, csv_path)
+
+    def _apply_p2p_update(self, msg):
+        """P2P 接收线程：校验 + 时钟钳制后进待合并队列，1.5 秒静默后批量应用。
+
+        逐条全量读写 user.csv 太慢，首次反熵可能一次涌入几百条，必须防抖。
+        """
+        radio_id = str(msg.get("radio_id", "")).strip()
+        if not radio_id:
+            return
+        try:
+            msg_ts = float(msg.get("ts", 0))
+        except (TypeError, ValueError):
+            return
+        # 时钟偏移钳制：未来超过 5 分钟的时间戳按本地当前时间算，
+        # 避免某台机器钟过快导致其修改永远赢过后到覆盖判定
+        now = time.time()
+        if msg_ts > now + 300:
+            msg_ts = now
+            msg = dict(msg, ts=msg_ts)
+
+        with self._p2p_merge_lock:
+            # 同一呼号窗口内多条消息只保留时间戳最大的一条
+            keep_new = True
+            old = self._p2p_pending.get(radio_id)
+            if old is not None:
+                try:
+                    keep_new = float(old.get("ts", 0)) < msg_ts
+                except (TypeError, ValueError):
+                    keep_new = True
+            if keep_new:
+                self._p2p_pending[radio_id] = msg
+            # 防抖：重置批量应用定时器
+            if self._p2p_flush_job is not None:
+                try:
+                    self.root.after_cancel(self._p2p_flush_job)
+                except Exception:
+                    pass
+            self._p2p_flush_job = self.root.after(
+                1500, self._flush_p2p_pending)
+
+    def _flush_p2p_pending(self):
+        """防抖定时器触发（GUI 线程）：取出队列，后台线程批量合并"""
+        self._p2p_flush_job = None
+        with self._p2p_merge_lock:
+            pending = self._p2p_pending
+            self._p2p_pending = {}
+        if pending:
+            threading.Thread(target=self._merge_p2p_batch,
+                             args=(pending,), daemon=True,
+                             name="p2p-merge").start()
+
+    def _merge_p2p_batch(self, pending):
+        """批量合并（后台线程）：整表读一次、应用全部、原子写一次。
+
+        本地尚无 user.csv 时跳过（消息已存历史，之后从主库下载的
+        user.csv 已由源头服务器合并，天然是最新）。
+        """
+        import pandas as pd
+
+        csv_path = self._resolve_user_csv_path()
+        if not os.path.exists(csv_path):
+            return
+
+        with self._p2p_merge_lock:
+            row_ts = self._p2p_load_row_ts()
+            try:
+                df = pd.read_csv(csv_path, dtype=str, keep_default_na=False,
+                                 encoding="utf-8-sig")
+            except Exception as ex:
+                self._p2p_log(f"P2P 合并读取 user.csv 失败: {ex}")
+                return
+            df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
+            for col in ("RADIO_ID", "CALLSIGN", "NAME", "CITY", "STATE",
+                        "COUNTRY", "REMARKS"):
+                if col not in df.columns:
+                    df[col] = ""
+
+            applied = []
+            for radio_id, msg in pending.items():
+                try:
+                    msg_ts = float(msg.get("ts", 0))
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    old_ts = float(row_ts.get(radio_id, 0) or 0)
+                except (TypeError, ValueError):
+                    old_ts = 0.0
+                if msg_ts <= old_ts:
+                    continue  # 本地已有更新的数据，丢弃
+                fields = {
+                    "CALLSIGN": str(msg.get("callsign", "")),
+                    "NAME": str(msg.get("name", "")),
+                    "CITY": str(msg.get("city", "")),
+                    "STATE": str(msg.get("state", "")),
+                    "COUNTRY": str(msg.get("country", "")),
+                    "REMARKS": str(msg.get("remarks", "")),
+                }
+                mask = df["RADIO_ID"].astype(str).str.strip() == radio_id
+                if mask.any():
+                    for col, val in fields.items():
+                        df.loc[mask, col] = val
+                else:
+                    # 主库没有的 ID：追加新行
+                    new_row = {c: "" for c in df.columns}
+                    new_row["RADIO_ID"] = radio_id
+                    new_row.update(fields)
+                    df = pd.concat([df, pd.DataFrame([new_row])],
+                                   ignore_index=True)
+                row_ts[radio_id] = msg_ts
+                applied.append((fields["CALLSIGN"],
+                                str(msg.get("author", "?"))))
+
+            if not applied:
+                return
+            try:
+                self._atomic_write_csv(df, csv_path)
+            except Exception as ex:
+                self._p2p_log(f"P2P 合并写入 user.csv 失败: {ex}")
+                return
+            self._p2p_save_row_ts(row_ts)
+
+        for callsign, author in applied:
+            self._p2p_log(f"P2P 已合并 {callsign} 来自 {author}")
+        last_callsign, last_author = applied[-1]
+        self._p2p_applied_total += len(applied)
+        self._p2p_last_sync_ts = time.time()
+        self._p2p_last_result = f"已应用 {len(applied)} 条（最后 {last_callsign} 来自 {last_author}）"
+        tip = (f"P2P: 已同步 {last_callsign} 等{len(applied)}条"
+               if len(applied) > 1
+               else f"P2P: 已同步 {last_callsign} (来自 {last_author})")
+        self.root.after(0, lambda t=tip: self._update_p2p_status(t, "green"))
+
+    def _broadcast_p2p_update(self, radio_id, callsign, values):
+        """本地编辑保存成功后广播修改。values 含 NAME/CITY/STATE/COUNTRY/REMARKS"""
+        if not self.p2p_node:
+            return None
+        msg = self.p2p_node.broadcast_user_update(
+            radio_id=radio_id, callsign=callsign,
+            name=values.get("NAME", ""), city=values.get("CITY", ""),
+            state=values.get("STATE", ""), country=values.get("COUNTRY", ""),
+            remarks=values.get("REMARKS", ""))
+        # 本地行时间戳也记录，避免收到旧消息时回滚本地新修改
+        with self._p2p_merge_lock:
+            row_ts = self._p2p_load_row_ts()
+            row_ts[str(radio_id)] = msg["ts"]
+            self._p2p_save_row_ts(row_ts)
+        return msg
+
+    def open_p2p_settings(self):
+        """P2P 同步设置对话框"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("P2P 联系人同步设置")
+        dlg.geometry("480x330")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        self.center_window(dlg)
+
+        frm = ttk.Frame(dlg, padding=15)
+        frm.pack(fill=tk.BOTH, expand=True)
+        frm.columnconfigure(1, weight=1)
+
+        cfg = self._p2p_config
+
+        enabled_var = tk.BooleanVar(value=bool(cfg.get("enabled", True)))
+        ttk.Checkbutton(frm, text="启用 P2P 联系人同步",
+                        variable=enabled_var).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=4)
+
+        ttk.Label(frm, text="本机呼号:").grid(row=1, column=0, sticky="w", pady=4)
+        callsign_var = tk.StringVar(value=cfg.get("callsign", ""))
+        ttk.Entry(frm, textvariable=callsign_var, width=20).grid(
+            row=1, column=1, sticky="w", pady=4, padx=(4, 0))
+        ttk.Label(frm, text="(作为修改者标识)", foreground="gray").grid(
+            row=1, column=2, sticky="w", padx=4)
+
+        listen_var = tk.BooleanVar(value=bool(cfg.get("listen_enabled")))
+        ttk.Checkbutton(frm, text="监听入站连接（源头服务器勾选，需公网IP/端口映射）",
+                        variable=listen_var).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=4)
+
+        ttk.Label(frm, text="监听端口:").grid(row=3, column=0, sticky="w", pady=4)
+        port_var = tk.StringVar(value=str(cfg.get("listen_port", 46001)))
+        ttk.Entry(frm, textvariable=port_var, width=10).grid(
+            row=3, column=1, sticky="w", pady=4, padx=(4, 0))
+
+        ttk.Label(frm, text="引导节点:").grid(row=4, column=0, sticky="nw", pady=4)
+        bootstrap_var = tk.StringVar(
+            value=", ".join(cfg.get("bootstrap") or []))
+        ttk.Entry(frm, textvariable=bootstrap_var, width=34).grid(
+            row=4, column=1, columnspan=2, sticky="ew", pady=4, padx=(4, 0))
+        ttk.Label(frm, text="格式 host:端口，多个用逗号分隔",
+                  foreground="gray").grid(
+            row=5, column=1, columnspan=2, sticky="w", padx=(4, 0))
+
+        status_var = tk.StringVar()
+        ttk.Label(frm, textvariable=status_var, foreground="green").grid(
+            row=6, column=0, columnspan=3, pady=4)
+
+        def do_save_cfg():
+            try:
+                port = int(port_var.get().strip())
+                if not (1 <= port <= 65535):
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("错误", "端口必须是 1-65535 的数字", parent=dlg)
+                return
+            bootstrap = [s.strip() for s in bootstrap_var.get().split(",")
+                         if s.strip() and ":" in s]
+            self._p2p_config = {
+                "enabled": enabled_var.get(),
+                "callsign": callsign_var.get().strip().upper(),
+                "listen_enabled": listen_var.get(),
+                "listen_port": port,
+                "bootstrap": bootstrap,
+            }
+            self._p2p_save_config()
+            self._restart_p2p_node()
+            status_var.set("已保存并重启 P2P 节点")
+            self._p2p_log(f"P2P 配置已更新: {self._p2p_config}")
+
+        btn_frame = ttk.Frame(frm)
+        btn_frame.grid(row=7, column=0, columnspan=3, pady=(10, 0))
+        ttk.Button(btn_frame, text="保存并应用", command=do_save_cfg).pack(
+            side="left", padx=8)
+        ttk.Button(btn_frame, text="关闭", command=dlg.destroy).pack(
+            side="left", padx=8)
+
     def edit_user_csv(self):
         """打开 user.csv 编辑窗口：输入呼号自动带出姓名/QTH，修改后提交写回文件"""
         import shutil
@@ -2006,7 +2537,8 @@ class MMDVMUpdater:
         apply_all_check.state(["disabled"])
 
         status_var = tk.StringVar()
-        status_label = ttk.Label(frm, textvariable=status_var, foreground="green")
+        status_label = ttk.Label(frm, textvariable=status_var, foreground="green",
+                                 wraplength=420, justify="left")
         status_label.grid(row=10, column=0, columnspan=3, pady=4)
 
         state = {"df": None, "matches": [], "pos": 0, "backed_up": False}
@@ -2114,16 +2646,27 @@ class MMDVMUpdater:
                 if not state["backed_up"]:
                     shutil.copy2(csv_path, csv_path + ".bak")
                     state["backed_up"] = True
-                state["df"].to_csv(csv_path, index=False, encoding="utf-8")
+                self._atomic_write_csv(state["df"], csv_path)
             except Exception as ex:
                 messagebox.showerror("错误", f"保存失败:\n{ex}", parent=dlg)
                 return
+            # P2P 广播：每条被修改的记录生成一条 JSON 消息发给全网
+            p2p_sent = 0
+            if self.p2p_node:
+                for idx in target_indexes:
+                    row = state["df"].loc[idx]
+                    if self._broadcast_p2p_update(
+                            str(row.get("RADIO_ID", "")).strip(),
+                            str(row.get("CALLSIGN", "")).strip(),
+                            new_values):
+                        p2p_sent += 1
             status_label.config(foreground="green")
             callsign = entries["CALLSIGN"].get()
+            p2p_tip = f"，已P2P广播{p2p_sent}条" if p2p_sent else ""
             if apply_all:
-                status_var.set(f"已批量保存：{callsign} 共 {len(target_indexes)} 条（原文件已备份为 user.csv.bak）")
+                status_var.set(f"已批量保存：{callsign} 共 {len(target_indexes)} 条（原文件已备份为 user.csv.bak）{p2p_tip}")
             else:
-                status_var.set(f"已保存：{callsign}（原文件已备份为 user.csv.bak）")
+                status_var.set(f"已保存：{callsign}（原文件已备份为 user.csv.bak）{p2p_tip}")
 
         # 查询 / 切换 / 保存 / 关闭
         query_btn = ttk.Button(frm, text="查询", command=do_search)

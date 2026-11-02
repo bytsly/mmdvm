@@ -26,6 +26,12 @@ build_log*.txt
 _install_log.txt
 _pip_log.txt
 
+# P2P 同步运行时数据（配置/历史/行时间戳，各节点私有）
+p2p_config.json
+p2p_row_ts.json
+p2p_updates.jsonl
+p2p.log
+
 # 运行/更新时自动生成的批处理
 do_update.bat
 update_reminder.bat
@@ -37,6 +43,10 @@ diag.spec
 # 临时工作目录与备份
 TMP/
 brand_templates_backup.db
+*.p2pverify.bak
+
+# 中继服务端运行数据库（含用户数据）
+relay_linux/relay_data.db
 
 # 联系人转换输出结果
 CSV/OUT/

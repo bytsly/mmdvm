@@ -5,7 +5,7 @@ a = Analysis(
     ['mmdvm_updater.py'],
     pathex=[],
     binaries=[],
-    datas=[('CSV', 'CSV'), ('brand_templates.db', '.'), ('brand_database.py', '.'), ('call_sign_province_mapper.py', '.')],
+    datas=[('CSV', 'CSV'), ('brand_templates.db', '.'), ('brand_database.py', '.'), ('call_sign_province_mapper.py', '.'), ('p2p_sync.py', '.')],
     hiddenimports=['http.cookies'],
     hookspath=[],
     hooksconfig={},

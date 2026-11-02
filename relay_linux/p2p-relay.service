@@ -1,0 +1,27 @@
+[Unit]
+Description=P2P Relay (点名校验 + MMDVM 联系人同步)
+Documentation=https://github.com/bytsly/mmdvm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=p2p-relay
+Group=p2p-relay
+WorkingDirectory=/opt/p2p-relay
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/p2p-relay/relay_server.py --host 0.0.0.0 --port 4570 --db /opt/p2p-relay/relay_data.db --mmdvm-port 46001
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# 基础加固：不监听特权端口，无需额外 Capability
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
